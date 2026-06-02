@@ -101,7 +101,7 @@ dependencies = [
 [[package]]
 name = "ce-rs"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce-rs#2ee4b34993887ef164f5b8479bbf1f79bcf0fe91"
+source = "git+https://github.com/ce-net/ce-rs#31c88fad24874d2bb1f43526377994f3dbef14e9"
 dependencies = [
  "anyhow",
  "reqwest",

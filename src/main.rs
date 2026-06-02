@@ -85,12 +85,31 @@ async fn main() -> Result<()> {
             if command.is_empty() {
                 bail!("provide a command to run, e.g. swarm run alpine:latest -- echo hi");
             }
-            let mut hosts = candidates(ce.atlas().await?, &select);
-            if hosts.is_empty() {
+            let pool = candidates(ce.atlas().await?, &select);
+            if pool.is_empty() {
                 bail!("no matching hosts in the atlas (need 'docker'{})", sel_note(&select));
             }
-            hosts.truncate(count);
-            println!("Fanning '{}' out to {} host(s)...\n", command.join(" "), hosts.len());
+
+            // Trust-tier the placement: rank candidates by delivered work (reputation read
+            // from each host's on-chain interaction history), so proven hosts get the work
+            // first. Strangers sort last. Apps can swap in a richer trust model.
+            let mut scored: Vec<(u64, AtlasEntry)> = Vec::new();
+            for h in pool {
+                let rep = ce.history(&h.node_id).await.map(|r| r.delivered_work()).unwrap_or(0);
+                scored.push((rep, h));
+            }
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            let hosts: Vec<(u64, AtlasEntry)> = scored.into_iter().take(count).collect();
+
+            println!("Fanning '{}' out to {} host(s) (most-proven first)...\n", command.join(" "), hosts.len());
+            let hosts: Vec<AtlasEntry> = hosts
+                .into_iter()
+                .map(|(rep, h)| {
+                    println!("  {} (delivered {rep} jobs)", &h.node_id[..h.node_id.len().min(12)]);
+                    h
+                })
+                .collect();
+            println!();
 
             // Scatter: dispatch to every host concurrently.
             let mut set = JoinSet::new();
