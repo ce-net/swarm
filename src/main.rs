@@ -48,6 +48,21 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Run an identical command redundantly on K hosts and verify they agree.
+    ///
+    /// The verification dial for deterministic work on untrusted hosts: K independent runs,
+    /// outputs compared. Unanimous = verified; divergence = a host lied (the minority is
+    /// suspect). Example: swarm verify alpine:latest -k 3 -- sha256sum /etc/os-release
+    Verify {
+        image: String,
+        #[arg(long)]
+        select: Option<String>,
+        /// Redundancy factor — how many independent hosts must run and agree.
+        #[arg(short = 'k', long = "replicas", default_value = "3")]
+        replicas: usize,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 /// Hosts that can run containers, optionally filtered by a capability self-tag.
@@ -85,63 +100,28 @@ async fn main() -> Result<()> {
             if command.is_empty() {
                 bail!("provide a command to run, e.g. swarm run alpine:latest -- echo hi");
             }
-            let pool = candidates(ce.atlas().await?, &select);
-            if pool.is_empty() {
-                bail!("no matching hosts in the atlas (need 'docker'{})", sel_note(&select));
-            }
-
-            // Trust-tier the placement: rank candidates by delivered work (reputation read
-            // from each host's on-chain interaction history), so proven hosts get the work
-            // first. Strangers sort last. Apps can swap in a richer trust model.
-            let mut scored: Vec<(u64, AtlasEntry)> = Vec::new();
-            for h in pool {
-                let rep = ce.history(&h.node_id).await.map(|r| r.delivered_work()).unwrap_or(0);
-                scored.push((rep, h));
-            }
-            scored.sort_by(|a, b| b.0.cmp(&a.0));
-            let hosts: Vec<(u64, AtlasEntry)> = scored.into_iter().take(count).collect();
-
+            let hosts = select_hosts(&ce, &select, count).await?;
             println!("Fanning '{}' out to {} host(s) (most-proven first)...\n", command.join(" "), hosts.len());
-            let hosts: Vec<AtlasEntry> = hosts
-                .into_iter()
-                .map(|(rep, h)| {
-                    println!("  {} (delivered {rep} jobs)", &h.node_id[..h.node_id.len().min(12)]);
-                    h
-                })
-                .collect();
+            for (rep, h) in &hosts {
+                println!("  {} (delivered {rep})", short(&h.node_id));
+            }
             println!();
 
-            // Scatter: dispatch to every host concurrently.
-            let mut set = JoinSet::new();
-            for h in hosts {
-                let ce = ce.clone();
-                let image = image.clone();
-                let command = command.clone();
-                let node_id = h.node_id.clone();
-                set.spawn(async move {
-                    let out = ce.mesh_exec(&node_id, &image, &command).await;
-                    (node_id, out)
-                });
-            }
-
-            // Gather: collect each result as it lands.
-            let mut ok = 0usize;
-            let mut failed = 0usize;
-            while let Some(joined) = set.join_next().await {
-                let (node_id, out) = joined?;
-                let short = &node_id[..node_id.len().min(8)];
+            let results = scatter(&ce, &hosts, &image, &command).await?;
+            let (mut ok, mut failed) = (0usize, 0usize);
+            for (node_id, out) in results {
                 match out {
                     Ok(r) if r.ok() => {
                         ok += 1;
-                        println!("[{short}] exit 0\n{}", indent(r.stdout.trim_end()));
+                        println!("[{}] exit 0\n{}", short(&node_id), indent(r.stdout.trim_end()));
                     }
                     Ok(r) => {
                         failed += 1;
-                        println!("[{short}] exit {}\n{}", r.exit_code, indent(r.stderr.trim_end()));
+                        println!("[{}] exit {}\n{}", short(&node_id), r.exit_code, indent(r.stderr.trim_end()));
                     }
                     Err(e) => {
                         failed += 1;
-                        println!("[{short}] dispatch failed: {e}");
+                        println!("[{}] dispatch failed: {e}", short(&node_id));
                     }
                 }
             }
@@ -150,8 +130,112 @@ async fn main() -> Result<()> {
                 bail!("no host returned a successful result");
             }
         }
+
+        Cmd::Verify { image, select, replicas, command } => {
+            if command.is_empty() {
+                bail!("provide a command to verify, e.g. swarm verify alpine:latest -- sha256sum /etc/hostname");
+            }
+            if replicas < 2 {
+                bail!("--replicas must be >= 2 for verification (use `run` for a single host)");
+            }
+            let hosts = select_hosts(&ce, &select, replicas).await?;
+            if hosts.len() < replicas {
+                eprintln!(
+                    "note: only {} matching host(s) available; verifying with {} of the requested {replicas}.",
+                    hosts.len(),
+                    hosts.len()
+                );
+            }
+            println!("Verifying '{}' across {} host(s)...\n", command.join(" "), hosts.len());
+
+            let results = scatter(&ce, &hosts, &image, &command).await?;
+
+            // Group successful runs by their (stdout, exit) — the "answer" each host returned.
+            let mut groups: std::collections::HashMap<(String, i64), Vec<String>> = std::collections::HashMap::new();
+            let mut errors = 0usize;
+            for (node_id, out) in results {
+                match out {
+                    Ok(r) => groups.entry((r.stdout.trim_end().to_string(), r.exit_code)).or_default().push(node_id),
+                    Err(e) => {
+                        errors += 1;
+                        println!("[{}] dispatch failed: {e}", short(&node_id));
+                    }
+                }
+            }
+
+            let mut groups: Vec<((String, i64), Vec<String>)> = groups.into_iter().collect();
+            groups.sort_by(|a, b| b.1.len().cmp(&a.1.len())); // majority first
+            let agreeing = groups.first().map(|g| g.1.len()).unwrap_or(0);
+            let total: usize = groups.iter().map(|g| g.1.len()).sum();
+
+            if groups.len() == 1 && errors == 0 {
+                let ((stdout, code), hosts) = &groups[0];
+                println!("✓ VERIFIED — {}/{} hosts agree (exit {code}):\n{}", hosts.len(), hosts.len(), indent(stdout));
+            } else {
+                println!("⚠ DIVERGENCE — {} distinct result(s) across {total} host(s):\n", groups.len());
+                for (i, ((stdout, code), nodes)) in groups.iter().enumerate() {
+                    let tag = if i == 0 { "majority" } else { "MINORITY (suspect)" };
+                    let who: Vec<String> = nodes.iter().map(|n| short(n)).collect();
+                    println!("  result {} — {} host(s) [{}] (exit {code}, {tag}):\n{}\n", i + 1, nodes.len(), who.join(","), indent(stdout));
+                }
+                println!("Majority result has {agreeing}/{total} agreement.");
+                if groups.len() > 1 {
+                    bail!("results diverged — at least one host returned a different answer");
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Discover docker-capable hosts matching `select`, ranked by on-chain delivered work
+/// (most-proven first), truncated to `count`. Returns (delivered_work, host).
+async fn select_hosts(
+    ce: &CeClient,
+    select: &Option<String>,
+    count: usize,
+) -> Result<Vec<(u64, AtlasEntry)>> {
+    let pool = candidates(ce.atlas().await?, select);
+    if pool.is_empty() {
+        bail!("no matching hosts in the atlas (need 'docker'{})", sel_note(select));
+    }
+    let mut scored: Vec<(u64, AtlasEntry)> = Vec::new();
+    for h in pool {
+        let rep = ce.history(&h.node_id).await.map(|r| r.delivered_work()).unwrap_or(0);
+        scored.push((rep, h));
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.truncate(count);
+    Ok(scored)
+}
+
+/// Run `command` in `image` on every host concurrently; return (node_id, result) pairs.
+async fn scatter(
+    ce: &CeClient,
+    hosts: &[(u64, AtlasEntry)],
+    image: &str,
+    command: &[String],
+) -> Result<Vec<(String, Result<ce_rs::ExecResult>)>> {
+    let mut set = JoinSet::new();
+    for (_, h) in hosts {
+        let ce = ce.clone();
+        let image = image.to_string();
+        let command = command.to_vec();
+        let node_id = h.node_id.clone();
+        set.spawn(async move {
+            let out = ce.mesh_exec(&node_id, &image, &command).await;
+            (node_id, out)
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        out.push(joined?);
+    }
+    Ok(out)
+}
+
+fn short(node_id: &str) -> String {
+    node_id[..node_id.len().min(12)].to_string()
 }
 
 fn sel_note(select: &Option<String>) -> String {

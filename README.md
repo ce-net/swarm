@@ -28,6 +28,10 @@ swarm run nvidia/cuda:latest -n 8 --select gpu -- nvidia-smi
 
 # Embarrassingly parallel: run the same job on every Docker host:
 swarm run alpine:latest -- sh -c 'echo hello from $(hostname)'
+
+# Redundancy verification: run identical work on 3 hosts and check they agree.
+# Unanimous = verified; divergence flags the minority (suspect) host.
+swarm verify alpine:latest -k 3 -- sha256sum /etc/os-release
 ```
 
 `--node <url>` points swarm at a different CE node.
@@ -40,12 +44,19 @@ swarm run alpine:latest -- sh -c 'echo hello from $(hostname)'
 
 ## v0 scope and what's next
 
-v0 is scatter/gather for **one-shot** commands (perceptible/verifiable work — you see the
-output). Documented next steps, as CE primitives land:
+v0 covers one-shot commands with two of the trust gradient's mechanisms working:
 
-- **Trust-tiered placement** — rank hosts by per-relationship reputation (needs the CE
-  reputation-read index); gate opaque work behind earned trust.
-- **Verification dials** — redundancy + random independent placement; spot-checks.
+- **Trust-tiered placement** ✅ — `run` ranks hosts by on-chain delivered work (`ce-rs history`)
+  and places on the most-proven first.
+- **Redundancy verification** ✅ — `verify -k K` runs identical work on K hosts and compares;
+  unanimous = verified, divergence flags the suspect minority.
+
+Documented next steps, as CE primitives land:
+
+- **Unpredictable independent selection** — random-at-dispatch host pick for stronger
+  anti-collusion (vs today's trust-ranked selection); the `/beacon` primitive enables auditable
+  variants.
+- **Gate opaque work behind earned trust**; spot-checks for long deterministic jobs.
 - **Long-running deploy** — directed `mesh_deploy`/`mesh_kill` (already in the SDK) with
   remote status polling.
 - **DAGs, retries, coordinator HA** (Raft for the coordinator's own state).
