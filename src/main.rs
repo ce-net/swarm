@@ -407,4 +407,180 @@ mod tests {
         assert_eq!(sel_note(&Some("gpu".into())), " + 'gpu'");
         assert_eq!(sel_note(&None), "");
     }
+
+    // ---- candidates: filtering edge cases ----
+
+    #[test]
+    fn candidates_empty_atlas_is_empty() {
+        assert!(candidates(vec![], &None).is_empty());
+        assert!(candidates(vec![], &Some("gpu".into())).is_empty());
+    }
+
+    #[test]
+    fn candidates_no_docker_anywhere_is_empty() {
+        let atlas = vec![host("a", &["linux"]), host("b", &["gpu"])];
+        assert!(candidates(atlas, &None).is_empty());
+    }
+
+    #[test]
+    fn candidates_select_matching_but_no_docker_is_excluded() {
+        // A host that has the selected tag but lacks docker must NOT be a candidate.
+        let atlas = vec![host("a", &["gpu"]), host("b", &["docker", "gpu"])];
+        let got = candidates(atlas, &Some("gpu".into()));
+        assert_eq!(got.iter().map(|h| h.node_id.as_str()).collect::<Vec<_>>(), vec!["b"]);
+    }
+
+    #[test]
+    fn candidates_preserve_atlas_order() {
+        let atlas = vec![
+            host("z", &["docker"]),
+            host("m", &["docker"]),
+            host("a", &["docker"]),
+        ];
+        let got = candidates(atlas, &None);
+        assert_eq!(got.iter().map(|h| h.node_id.as_str()).collect::<Vec<_>>(), vec!["z", "m", "a"]);
+    }
+
+    #[test]
+    fn candidates_select_with_no_matches_is_empty() {
+        let atlas = vec![host("a", &["docker", "linux"])];
+        assert!(candidates(atlas, &Some("windows".into())).is_empty());
+    }
+
+    // ---- ExecOut::success: full truth table ----
+
+    #[test]
+    fn exec_out_success_truth_table() {
+        // ok && exit==0 → success
+        assert!(ExecOut { ok: true, stdout: "x".into(), stderr: String::new(), exit_code: 0 }.success());
+        // ok but nonzero exit → not success (any nonzero, incl. negative)
+        assert!(!ExecOut { ok: true, stdout: String::new(), stderr: String::new(), exit_code: 1 }.success());
+        assert!(!ExecOut { ok: true, stdout: String::new(), stderr: String::new(), exit_code: -1 }.success());
+        // not ok even with exit 0 → not success
+        assert!(!ExecOut { ok: false, stdout: String::new(), stderr: String::new(), exit_code: 0 }.success());
+    }
+
+    // ---- tally: grouping / majority ordering invariants ----
+
+    #[test]
+    fn tally_empty_is_empty() {
+        assert!(tally(vec![]).is_empty());
+    }
+
+    #[test]
+    fn tally_single_run_is_one_group() {
+        let g = tally(vec![("a".into(), out("hi", 0))]);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].1, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn tally_normalizes_only_trailing_whitespace() {
+        // Leading/interior whitespace is significant; only trailing is trimmed.
+        let g = tally(vec![
+            ("a".into(), out("X\n\n", 0)),
+            ("b".into(), out("X", 0)),
+            ("c".into(), out(" X", 0)), // leading space → distinct answer
+        ]);
+        assert_eq!(g.len(), 2, "trailing-trimmed agree; leading-space diverges");
+        assert_eq!(g[0].1.len(), 2);
+    }
+
+    #[test]
+    fn tally_total_membership_is_conserved() {
+        // The sum of group sizes always equals the number of successful runs.
+        let oks = vec![
+            ("a".into(), out("p", 0)),
+            ("b".into(), out("q", 0)),
+            ("c".into(), out("p", 0)),
+            ("d".into(), out("r", 1)),
+            ("e".into(), out("p", 0)),
+        ];
+        let n = oks.len();
+        let g = tally(oks);
+        let total: usize = g.iter().map(|grp| grp.1.len()).sum();
+        assert_eq!(total, n);
+    }
+
+    #[test]
+    fn tally_is_sorted_majority_first() {
+        let g = tally(vec![
+            ("a".into(), out("rare", 0)),
+            ("b".into(), out("common", 0)),
+            ("c".into(), out("common", 0)),
+            ("d".into(), out("common", 0)),
+        ]);
+        // groups are in non-increasing size order
+        for w in g.windows(2) {
+            assert!(w[0].1.len() >= w[1].1.len(), "majority-first ordering violated");
+        }
+        assert_eq!((g[0].0).0, "common");
+        assert_eq!(g[0].1.len(), 3);
+    }
+
+    #[test]
+    fn tally_all_distinct_each_its_own_group() {
+        let g = tally(vec![
+            ("a".into(), out("1", 0)),
+            ("b".into(), out("2", 0)),
+            ("c".into(), out("3", 0)),
+        ]);
+        assert_eq!(g.len(), 3);
+        assert!(g.iter().all(|grp| grp.1.len() == 1));
+    }
+
+    // ---- RdevResp: tolerant deserialization ----
+
+    #[test]
+    fn rdev_resp_defaults_when_fields_absent() {
+        // Only `ok` is mandatory; everything else defaults.
+        let r: RdevResp = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(r.ok);
+        assert!(r.error.is_none());
+        assert!(r.stdout.is_none());
+        assert!(r.stderr.is_none());
+        assert!(r.exit_code.is_none());
+    }
+
+    #[test]
+    fn rdev_resp_full_payload() {
+        let r: RdevResp = serde_json::from_str(
+            r#"{"ok":true,"stdout":"out","stderr":"err","exit_code":7,"error":null}"#,
+        )
+        .unwrap();
+        assert!(r.ok);
+        assert_eq!(r.stdout.as_deref(), Some("out"));
+        assert_eq!(r.stderr.as_deref(), Some("err"));
+        assert_eq!(r.exit_code, Some(7));
+    }
+
+    #[test]
+    fn rdev_resp_rejects_missing_ok() {
+        // `ok` has no default, so an object without it must fail to parse.
+        assert!(serde_json::from_str::<RdevResp>(r#"{"stdout":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn rdev_resp_negative_exit_code() {
+        let r: RdevResp = serde_json::from_str(r#"{"ok":true,"exit_code":-9}"#).unwrap();
+        assert_eq!(r.exit_code, Some(-9));
+    }
+
+    // ---- helpers: boundary behavior ----
+
+    #[test]
+    fn short_does_not_panic_on_short_or_unicode_boundary() {
+        assert_eq!(short(""), "");
+        assert_eq!(short("abc"), "abc");
+        // exactly 12 chars stays whole
+        assert_eq!(short("0123456789ab"), "0123456789ab");
+        // 13 chars truncates to 12
+        assert_eq!(short("0123456789abc"), "0123456789ab");
+    }
+
+    #[test]
+    fn indent_trailing_newline_does_not_add_phantom_line() {
+        // "a\n" has a single content line "a"; lines() drops the trailing empty.
+        assert_eq!(indent("a\n"), "    a");
+    }
 }
