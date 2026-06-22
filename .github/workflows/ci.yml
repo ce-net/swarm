@@ -3,13 +3,28 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+
 jobs:
-  test:
-    name: cargo test
-    runs-on: ubuntu-latest
+  build-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Unit + integration tests
+
+      # swarm depends on ce-rs (and transitively ce) as *git* dependencies
+      # (github.com/ce-net/*), so cargo fetches them itself during the build.
+      # No sibling checkout is needed — and actions/checkout cannot place a repo
+      # at ../ce-rs outside $GITHUB_WORKSPACE anyway. If these ever become path
+      # deps, add a sibling `actions/checkout` per dep and a `[patch]` in Cargo.toml.
+
+      - name: Build
+        run: cargo build --all --locked
+
+      - name: Test
         run: cargo test --all --locked
