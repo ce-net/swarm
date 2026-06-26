@@ -3,7 +3,7 @@ name = "swarm"
 version = "0.1.0"
 edition = "2024"
 description = "Distributed work scheduler on the CE compute mesh — fan work out across hosts, gather results."
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/ce-net/swarm"
 
 [dependencies]
