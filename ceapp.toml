@@ -1,0 +1,23 @@
+# swarm — a distributed work scheduler on the CE compute mesh, installed through the
+# one `ce` binary. `ce app install swarm`, then submit and track work across mesh hosts.
+
+[app]
+name    = "swarm"
+version = "0.1.0"
+summary = "Distributed work scheduler on the CE compute mesh"
+runtime = "native"
+publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"
+
+[native]
+bin = "swarm"
+[native.artifacts]
+"darwin-amd64" = "PLACEHOLDER_darwin_amd64"
+"linux-amd64"  = "PLACEHOLDER_linux_amd64"
+
+[deps]
+# Schedules + tracks work over the local node's mesh API; placement/settlement is ce-cap-gated.
+
+[sandbox]
+tier       = "none"
+net        = "loopback"
+capability = "inherit"
